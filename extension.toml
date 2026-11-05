@@ -1,0 +1,15 @@
+id = "bun-lint"
+name = "Bun Lint"
+version = "0.1.0"
+schema_version = 1
+description = "Diagnostics, quick fixes and fix-all-on-save from `bun lint`, the way the ESLint integration works"
+authors = ["Rick Clare <rick.clare@carescribe.io>"]
+
+[language_servers.bun-lint]
+name = "bun lint"
+languages = ["JavaScript", "TypeScript", "TSX"]
+
+[language_servers.bun-lint.language_ids]
+"JavaScript" = "javascript"
+"TypeScript" = "typescript"
+"TSX" = "typescriptreact"
