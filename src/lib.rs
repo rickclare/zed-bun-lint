@@ -30,6 +30,11 @@ impl BunLintExtension {
     }
 }
 
+/// The user's `lsp.bun-lint` settings for this worktree.
+fn lsp_settings(language_server_id: &LanguageServerId, worktree: &Worktree) -> Option<LspSettings> {
+    LspSettings::for_worktree(language_server_id.as_ref(), worktree).ok()
+}
+
 impl zed::Extension for BunLintExtension {
     fn new() -> Self {
         Self
@@ -40,9 +45,8 @@ impl zed::Extension for BunLintExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<zed::Command> {
-        let binary = LspSettings::for_worktree(language_server_id.as_ref(), worktree)
-            .ok()
-            .and_then(|settings| settings.binary);
+        let binary =
+            lsp_settings(language_server_id, worktree).and_then(|settings| settings.binary);
 
         let bun = binary
             .as_ref()
@@ -67,19 +71,18 @@ impl zed::Extension for BunLintExtension {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Option<serde_json::Value>> {
-        Ok(LspSettings::for_worktree(language_server_id.as_ref(), worktree)
-            .ok()
-            .and_then(|settings| settings.settings))
+        Ok(lsp_settings(language_server_id, worktree).and_then(|settings| settings.settings))
     }
 
+    /// Keyed by `bun-lint`, the section the server asks for in `workspace/configuration`.
     fn language_server_workspace_configuration(
         &mut self,
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Option<serde_json::Value>> {
-        Ok(LspSettings::for_worktree(language_server_id.as_ref(), worktree)
-            .ok()
-            .and_then(|settings| settings.settings))
+        Ok(lsp_settings(language_server_id, worktree)
+            .and_then(|settings| settings.settings)
+            .map(|settings| serde_json::json!({ "bun-lint": settings })))
     }
 }
 

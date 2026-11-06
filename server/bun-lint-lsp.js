@@ -37,15 +37,29 @@ const CONFIG_FILES = [
 ];
 
 const Severity = { Error: 1, Warning: 2 };
-const ErrorCodes = { MethodNotFound: -32601, InternalError: -32603, ServerNotInitialized: -32002 };
+const MessageType = { Error: 1, Info: 3 };
+const ErrorCodes = { MethodNotFound: -32601, InternalError: -32603 };
+const DEFAULT_SETTINGS = { run: "onType", debounce: 200, quiet: false, typeAware: false, extraArgs: [], workingDirectory: null };
+const RULE_DOCS = {
+  "@typescript-eslint": (rule) => `https://typescript-eslint.io/rules/${rule}`,
+  unicorn: (rule) => `https://github.com/sindresorhus/eslint-plugin-unicorn/blob/main/docs/rules/${rule}.md`,
+  import: (rule) => `https://github.com/import-js/eslint-plugin-import/blob/main/docs/rules/${rule}.md`,
+  react: (rule) => `https://github.com/jsx-eslint/eslint-plugin-react/blob/master/docs/rules/${rule}.md`,
+  "react-hooks": () => "https://react.dev/reference/rules/rules-of-hooks",
+  "jsx-a11y": (rule) => `https://github.com/jsx-eslint/eslint-plugin-jsx-a11y/blob/main/docs/rules/${rule}.md`,
+};
 
 const bun = process.execPath;
 let workspaceRoots = [];
-let settings = { run: "onType", debounce: 200, quiet: false, typeAware: false, extraArgs: [], workingDirectory: null };
+let settings = DEFAULT_SETTINGS;
 let shuttingDown = false;
 let reportedFailure = false;
 
-/** @type {Map<string, {uri: string, languageId: string, version: number, text: string, timer?: any, result?: {version: number, messages: any[]}}>} */
+/**
+ * Open documents. `lint`, `fixAll` and `lines` cache work for one version of the text.
+ * @typedef {{version: number, promise: Promise<any>}} Run
+ * @type {Map<string, {uri: string, version: number, text: string, timer?: any, lint?: Run, fixAll?: Run, lines?: {version: number, starts: number[]}}>}
+ */
 const documents = new Map();
 
 // ---------------------------------------------------------------------------
@@ -80,7 +94,7 @@ process.stdin.on("data", (chunk) => {
     dispatch(message);
   }
 });
-process.stdin.on("end", () => process.exit(shuttingDown ? 0 : 1));
+process.stdin.on("end", () => handlers.exit());
 
 function send(message) {
   const json = JSON.stringify({ jsonrpc: "2.0", ...message });
@@ -97,7 +111,7 @@ function request(method, params) {
   return new Promise((resolve) => pendingRequests.set(id, resolve));
 }
 
-function log(message, type = 3) {
+function log(message, type = MessageType.Info) {
   notify("window/logMessage", { type, message: `[bun lint] ${message}` });
 }
 
@@ -120,7 +134,7 @@ async function dispatch(message) {
     const result = await handler(message.params ?? {});
     if (isRequest) send({ id: message.id, result: result ?? null });
   } catch (error) {
-    log(`${message.method} failed: ${error?.stack ?? error}`, 1);
+    log(`${message.method} failed: ${error?.stack ?? error}`, MessageType.Error);
     if (isRequest) send({ id: message.id, error: { code: ErrorCodes.InternalError, message: String(error?.message ?? error) } });
   }
 }
@@ -161,11 +175,14 @@ const handlers = {
 
   "workspace/didChangeConfiguration"(params) {
     applySettings(params.settings);
-    for (const doc of documents.values()) scheduleLint(doc, 0);
+    for (const doc of documents.values()) {
+      doc.lint = doc.fixAll = undefined;
+      scheduleLint(doc, 0);
+    }
   },
 
   "textDocument/didOpen"({ textDocument }) {
-    const doc = { uri: textDocument.uri, languageId: textDocument.languageId, version: textDocument.version, text: textDocument.text };
+    const doc = { uri: textDocument.uri, version: textDocument.version, text: textDocument.text };
     documents.set(doc.uri, doc);
     scheduleLint(doc, 0);
   },
@@ -205,7 +222,7 @@ const handlers = {
     if (wants("quickfix")) {
       const result = await currentResult(doc);
       if (!result) return [];
-      const lines = lineStarts(doc.text);
+      const lines = lineStartsOf(doc);
       for (const message of result.messages) {
         if (!message.ruleId || !rangesOverlap(messageRange(message, doc.text, lines), range)) continue;
         actions.push(...quickFixes(doc, message, lines));
@@ -232,8 +249,8 @@ const handlers = {
 
 function applySettings(value) {
   if (!value || typeof value !== "object") return;
-  const config = value["bun-lint"] ?? value;
-  settings = { ...settings, ...config };
+  // Merge onto the defaults, so a setting removed in Zed goes back to its default
+  settings = { ...DEFAULT_SETTINGS, ...(value["bun-lint"] ?? value) };
   if (!Array.isArray(settings.extraArgs)) settings.extraArgs = [];
 }
 
@@ -247,9 +264,10 @@ function scheduleLint(doc, delay) {
 
 async function lintAndPublish(doc) {
   const version = doc.version;
-  const result = await lint(doc, version);
+  doc.lint = undefined; // always lint afresh here, e.g. on save
+  const result = await currentResult(doc);
   if (!result || documents.get(doc.uri) !== doc || doc.version !== version) return;
-  const lines = lineStarts(doc.text);
+  const lines = lineStartsOf(doc);
   notify("textDocument/publishDiagnostics", {
     uri: doc.uri,
     version,
@@ -257,27 +275,39 @@ async function lintAndPublish(doc) {
   });
 }
 
-/** The lint result for the buffer as it is now, linting again if it changed. */
-async function currentResult(doc) {
-  if (doc.result?.version === doc.version) return doc.result;
-  return lint(doc, doc.version);
+/** The lint result for the buffer as it is now, sharing a run already started for this version. */
+function currentResult(doc) {
+  return runOncePerVersion(doc, "lint", async () => {
+    const output = await runBunLint(doc, []);
+    if (!output) return undefined;
+    return { messages: (output.messages ?? []).filter((message) => !isIgnoredFileNotice(message)) };
+  });
 }
 
-async function lint(doc, version) {
-  const output = await runBunLint(doc, []);
-  if (!output) return undefined;
-  const messages = (output.messages ?? []).filter((message) => !isIgnoredFileNotice(message));
-  const result = { version, messages };
-  if (doc.version === version) doc.result = result;
-  return result;
-}
-
-/** Edits that apply every auto-fix, from `bun lint --fix-dry-run`. */
+/** Edits that apply every auto-fix, from `bun lint --fix-dry-run`. Undefined if the buffer changed meanwhile. */
 async function fixAllEdits(doc) {
-  const text = doc.text;
-  const output = await runBunLint(doc, ["--fix-dry-run"]);
-  if (output?.output === undefined || output.output === text || doc.text !== text) return undefined;
-  return [minimalEdit(text, output.output)];
+  const version = doc.version;
+  const edits = await runOncePerVersion(doc, "fixAll", async () => {
+    const text = doc.text;
+    const output = await runBunLint(doc, ["--fix-dry-run"]);
+    if (output?.output === undefined) return undefined;
+    return output.output === text ? [] : [minimalEdit(text, output.output)];
+  });
+  return doc.version === version ? edits : undefined;
+}
+
+/**
+ * Runs `start` at most once per document version for `key`, so code actions and
+ * formatting share one `bun lint` run. A run that fails (undefined) is not kept.
+ */
+function runOncePerVersion(doc, key, start) {
+  if (doc[key]?.version === doc.version) return doc[key].promise;
+  const run = { version: doc.version, promise: start() };
+  doc[key] = run;
+  run.promise.then((value) => {
+    if (value === undefined && doc[key] === run) doc[key] = undefined;
+  });
+  return run.promise;
 }
 
 async function runBunLint(doc, extraArgs) {
@@ -304,8 +334,8 @@ async function runBunLint(doc, extraArgs) {
   }
 
   const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+    proc.stdout.text(),
+    proc.stderr.text(),
     proc.exited,
   ]);
 
@@ -321,10 +351,10 @@ async function runBunLint(doc, extraArgs) {
 }
 
 function reportFailure(message) {
-  log(message, 1);
+  log(message, MessageType.Error);
   if (reportedFailure) return;
   reportedFailure = true;
-  notify("window/showMessage", { type: 1, message: `bun lint failed. See the bun lint server log.\n${message.split("\n")[0]}` });
+  notify("window/showMessage", { type: MessageType.Error, message: `bun lint failed. See the bun lint server log.\n${message.split("\n")[0]}` });
 }
 
 /** ESLint says "File ignored..." for files the config does not cover. The ESLint integration hides these too. */
@@ -333,16 +363,13 @@ function isIgnoredFileNotice(message) {
 }
 
 function workingDirectoryFor(path) {
-  if (settings.workingDirectory) {
-    const root = workspaceRootFor(path) ?? dirname(path);
-    return resolve(root, settings.workingDirectory);
-  }
   const root = workspaceRootFor(path);
+  if (settings.workingDirectory) return resolve(root ?? dirname(path), settings.workingDirectory);
   let dir = dirname(path);
   for (;;) {
     if (CONFIG_FILES.some((name) => existsSync(join(dir, name)))) return dir;
     const parent = dirname(dir);
-    if (dir === root || parent === dir || (root && !isInside(parent, root))) break;
+    if (parent === dir || (root && !isInside(parent, root))) break;
     dir = parent;
   }
   return root ?? dirname(path);
@@ -376,47 +403,24 @@ function toDiagnostic(message, text, lines) {
 
 function quickFixes(doc, message, lines) {
   const rule = message.ruleId;
-  const actions = [];
   const diagnostics = [toDiagnostic(message, doc.text, lines)];
-  const edit = (edits) => ({ changes: { [doc.uri]: edits } });
+  const quickfix = (title, edit, extra) => ({ title, kind: "quickfix", ...extra, diagnostics, edit: { changes: { [doc.uri]: [edit] } } });
+  const insertAt = (line, newText) => ({ range: { start: { line, character: 0 }, end: { line, character: 0 } }, newText });
 
-  if (message.fix) {
-    actions.push({
-      title: `Fix this ${rule} problem`,
-      kind: "quickfix",
-      isPreferred: true,
-      diagnostics,
-      edit: edit([fixToEdit(message.fix, doc.text, lines)]),
-    });
-  }
+  const actions = [];
+  if (message.fix) actions.push(quickfix(`Fix this ${rule} problem`, fixToEdit(message.fix, lines), { isPreferred: true }));
   for (const suggestion of message.suggestions ?? []) {
-    actions.push({
-      title: suggestion.desc ?? `Apply the ${rule} suggestion`,
-      kind: "quickfix",
-      diagnostics,
-      edit: edit([fixToEdit(suggestion.fix, doc.text, lines)]),
-    });
+    actions.push(quickfix(suggestion.desc ?? `Apply the ${rule} suggestion`, fixToEdit(suggestion.fix, lines)));
   }
 
   // eslint-disable-next-line above the problem line, keeping its indentation
-  const line = Math.max(0, (message.line ?? 1) - 1);
-  const lineText = doc.text.slice(lines[line], lines[line + 1] ?? doc.text.length);
-  const indent = /^[ \t]*/.exec(lineText)[0];
-  actions.push({
-    title: `Disable ${rule} for this line`,
-    kind: "quickfix",
-    diagnostics,
-    edit: edit([{ range: { start: { line, character: 0 }, end: { line, character: 0 } }, newText: `${indent}// eslint-disable-next-line ${rule}\n` }]),
-  });
+  const line = zeroBased(message.line);
+  const indent = /^[ \t]*/.exec(doc.text.slice(lines[line], lines[line + 1] ?? doc.text.length))[0];
+  actions.push(quickfix(`Disable ${rule} for this line`, insertAt(line, `${indent}// eslint-disable-next-line ${rule}\n`)));
 
   // /* eslint-disable */ at the top of the file, below any shebang
   const fileLine = doc.text.startsWith("#!") ? 1 : 0;
-  actions.push({
-    title: `Disable ${rule} for the entire file`,
-    kind: "quickfix",
-    diagnostics,
-    edit: edit([{ range: { start: { line: fileLine, character: 0 }, end: { line: fileLine, character: 0 } }, newText: `/* eslint-disable ${rule} */\n` }]),
-  });
+  actions.push(quickfix(`Disable ${rule} for the entire file`, insertAt(fileLine, `/* eslint-disable ${rule} */\n`)));
 
   return actions;
 }
@@ -424,15 +428,7 @@ function quickFixes(doc, message, lines) {
 function ruleUrl(ruleId) {
   if (!ruleId.includes("/")) return `https://eslint.org/docs/latest/rules/${ruleId}`;
   const [plugin, rule] = ruleId.split("/");
-  const known = {
-    "@typescript-eslint": `https://typescript-eslint.io/rules/${rule}`,
-    unicorn: `https://github.com/sindresorhus/eslint-plugin-unicorn/blob/main/docs/rules/${rule}.md`,
-    import: `https://github.com/import-js/eslint-plugin-import/blob/main/docs/rules/${rule}.md`,
-    react: `https://github.com/jsx-eslint/eslint-plugin-react/blob/master/docs/rules/${rule}.md`,
-    "react-hooks": "https://react.dev/reference/rules/rules-of-hooks",
-    "jsx-a11y": `https://github.com/jsx-eslint/eslint-plugin-jsx-a11y/blob/main/docs/rules/${rule}.md`,
-  };
-  return known[plugin];
+  return RULE_DOCS[plugin]?.(rule);
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +448,17 @@ function lineStarts(text) {
   return starts;
 }
 
+/** `lineStarts` of the document's current text, computed once per version. */
+function lineStartsOf(doc) {
+  if (doc.lines?.version !== doc.version) doc.lines = { version: doc.version, starts: lineStarts(doc.text) };
+  return doc.lines.starts;
+}
+
+/** An ESLint 1-based line or column as a 0-based LSP one. */
+function zeroBased(n) {
+  return Math.max(0, (n ?? 1) - 1);
+}
+
 function offsetToPosition(offset, lines) {
   let low = 0;
   let high = lines.length - 1;
@@ -464,10 +471,10 @@ function offsetToPosition(offset, lines) {
 }
 
 function messageRange(message, text, lines) {
-  const startLine = Math.max(0, (message.line ?? 1) - 1);
-  const start = { line: startLine, character: Math.max(0, (message.column ?? 1) - 1) };
+  const startLine = zeroBased(message.line);
+  const start = { line: startLine, character: zeroBased(message.column) };
   if (message.endLine) {
-    return { start, end: { line: message.endLine - 1, character: Math.max(0, (message.endColumn ?? 1) - 1) } };
+    return { start, end: { line: message.endLine - 1, character: zeroBased(message.endColumn) } };
   }
   // No end: underline to the end of the line, like the ESLint integration does for parse errors
   const lineEnd = (lines[startLine + 1] ?? text.length + 1) - 1;
@@ -475,7 +482,7 @@ function messageRange(message, text, lines) {
   return { start, end: { line: startLine, character: text[lineEnd - 1] === "\r" ? endChar - 1 : endChar } };
 }
 
-function fixToEdit(fix, text, lines) {
+function fixToEdit(fix, lines) {
   return {
     range: { start: offsetToPosition(fix.range[0], lines), end: offsetToPosition(fix.range[1], lines) },
     newText: fix.text,
